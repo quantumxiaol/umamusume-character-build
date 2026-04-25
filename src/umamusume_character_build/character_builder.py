@@ -47,7 +47,16 @@ def _normalize_name(value: str) -> str:
 
 
 def _slugify(value: str) -> str:
-    return _normalize_name(value).replace(" ", "_")
+    cleaned = re.sub(r"[\\/]+", " ", value)
+    cleaned = re.sub(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u9fff._ -]+", " ", cleaned)
+    slug = _normalize_name(cleaned).replace(" ", "_").strip("._")
+    return slug or "unknown"
+
+
+def _hyphenated_filename_name(value: str) -> str:
+    cleaned = value.strip().replace("_", " ").replace("\u3000", " ")
+    cleaned = " ".join(cleaned.split())
+    return re.sub(r"[^A-Za-z0-9]+", "-", cleaned).strip("-") or "unknown"
 
 
 def _load_character_map(path: Path) -> Dict[str, str]:
@@ -371,7 +380,91 @@ def _save_character_config(character: CharacterConfig) -> None:
         )
 
 
-def _extract_names_from_prompt(prompt_text: str) -> Tuple[Optional[str], Optional[str]]:
+def _iter_image_dirs(image_dir: Path) -> Dict[str, Path]:
+    aliases = {
+        "result-images": "results-images",
+        "results-images": "result-images",
+    }
+    if not image_dir.exists() and image_dir.name in aliases:
+        fallback = image_dir.with_name(aliases[image_dir.name])
+        if fallback.exists():
+            logger.warning("Image directory %s not found, using %s instead.", image_dir, fallback)
+            image_dir = fallback
+
+    if not image_dir.exists():
+        logger.warning("Image directory not found: %s. Character images will be skipped.", image_dir)
+        return {}
+    return {_normalize_name(p.name): p for p in image_dir.iterdir() if p.is_dir()}
+
+
+def _select_character_image(source_dir: Path, prefix: str) -> Optional[Path]:
+    allowed_suffixes = {".png", ".jpg", ".jpeg", ".webp"}
+    prefix_lower = prefix.lower()
+    candidates = [
+        path
+        for path in source_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in allowed_suffixes
+        and path.name.lower().startswith(f"{prefix_lower}_")
+    ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda path: (path.stat().st_size, path.name), reverse=True)[0]
+
+
+def package_character_images(
+    name_en: str,
+    character_dir: Path,
+    image_dirs: Dict[str, Path],
+    dry_run: bool = False,
+) -> List[Path]:
+    source_dir = image_dirs.get(_normalize_name(name_en))
+    if not source_dir:
+        logger.warning("Skip images for %s: image directory not found", name_en)
+        return []
+
+    filename_name = _hyphenated_filename_name(name_en)
+    copied: List[Path] = []
+    for source_prefix, target_prefix in (("Jsf", "JSF"), ("Zf", "ZF")):
+        source = _select_character_image(source_dir, source_prefix)
+        if not source:
+            logger.warning(
+                "Skip %s image for %s: no %s_* file in %s",
+                target_prefix,
+                name_en,
+                source_prefix,
+                source_dir,
+            )
+            continue
+
+        target = character_dir / f"{target_prefix}_{filename_name}{source.suffix.lower()}"
+        if dry_run:
+            logger.info('Would copy "%s" -> "%s"', source, target)
+        else:
+            character_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            logger.info('Copied "%s" -> "%s"', source, target)
+        copied.append(target)
+    return copied
+
+
+def _split_prompt_name_aliases(value: str) -> Tuple[Optional[str], Optional[str]]:
+    aliases = [part.strip() for part in re.split(r"[/／|｜]", value) if part.strip()]
+    if not aliases:
+        return None, None
+
+    english = None
+    japanese = None
+    for alias in aliases:
+        if english is None and re.search(r"[A-Za-z]", alias):
+            english = alias
+        if japanese is None and re.search(r"[\u3040-\u30ff]", alias):
+            japanese = alias
+
+    return english or aliases[0], japanese
+
+
+def _extract_names_from_prompt(prompt_text: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     # Match title patterns like: # 角色扮演提示词：爱慕织姬（Admire Vega）
     patterns = [
         re.compile(r"角色扮演提示词[:：]\s*([^\(\n（]+?)\s*[（(]\s*([^\)）\n]+?)\s*[)）]"),
@@ -385,21 +478,21 @@ def _extract_names_from_prompt(prompt_text: str) -> Tuple[Optional[str], Optiona
             match = pattern.search(candidate)
             if match:
                 name_zh = match.group(1).strip().strip("*")
-                name_en = match.group(2).strip().strip("*")
-                if name_zh or name_en:
-                    return name_zh or None, name_en or None
-    return None, None
+                name_en, name_jp = _split_prompt_name_aliases(match.group(2).strip().strip("*"))
+                if name_zh or name_en or name_jp:
+                    return name_zh or None, name_en or None, name_jp or None
+    return None, None, None
 
 
 def _resolve_name_info(prompt_en: str, en_to_zh: Dict[str, str], prompt_text: str) -> Dict[str, str]:
     normalized = _normalize_name(prompt_en)
-    prompt_name_zh, prompt_name_en = _extract_names_from_prompt(prompt_text)
+    prompt_name_zh, prompt_name_en, prompt_name_jp = _extract_names_from_prompt(prompt_text)
     name_zh = en_to_zh.get(normalized) or prompt_name_zh or prompt_en
     name_en = prompt_name_en or prompt_en
     return {
         "name_en": name_en,
         "name_zh": name_zh,
-        "name_jp": name_en,
+        "name_jp": prompt_name_jp or name_en,
         "source_wiki": f"https://wiki.biligame.com/umamusume/{name_zh}",
     }
 
@@ -407,12 +500,14 @@ def _resolve_name_info(prompt_en: str, en_to_zh: Dict[str, str], prompt_text: st
 def build_characters(
     prompt_dir: Path,
     voice_dir: Path,
+    image_dir: Path,
     output_dir: Path,
     character_map_path: Path,
     workers: int = 1,
     dry_run: bool = False,
     target_characters: Optional[Iterable[str]] = None,
     max_candidates: Optional[int] = None,
+    include_images: bool = False,
 ) -> List[str]:
     prompt_files = sorted([p for p in prompt_dir.iterdir() if p.is_file() and p.suffix.lower() in {".md", ".txt"}])
     if voice_dir.exists():
@@ -424,6 +519,7 @@ def build_characters(
         )
         voice_dirs = {}
 
+    image_dirs = _iter_image_dirs(image_dir) if include_images else {}
     en_to_zh = _load_character_map(character_map_path)
     target_set: Optional[Set[str]] = None
     if target_characters:
@@ -461,6 +557,8 @@ def build_characters(
         logger.info("Building character %s -> %s", prompt_en, character_dir)
 
         if dry_run:
+            if include_images:
+                package_character_images(name_info["name_en"], character_dir, image_dirs, dry_run=True)
             built.append(character_slug)
             continue
 
@@ -484,10 +582,52 @@ def build_characters(
             no_voice=no_voice,
         )
         _save_character_config(character_config)
+        if include_images:
+            package_character_images(name_info["name_en"], character_dir, image_dirs)
 
         built.append(character_slug)
 
     return built
+
+
+def package_existing_character_images(
+    image_dir: Path,
+    output_dir: Path,
+    dry_run: bool = False,
+    target_characters: Optional[Iterable[str]] = None,
+) -> List[str]:
+    if not output_dir.exists():
+        logger.warning("Characters directory not found: %s", output_dir)
+        return []
+
+    image_dirs = _iter_image_dirs(image_dir)
+    target_set: Optional[Set[str]] = None
+    if target_characters:
+        target_set = {_normalize_name(name) for name in target_characters if name and name.strip()}
+
+    processed: List[str] = []
+    for character_dir in sorted(p for p in output_dir.iterdir() if p.is_dir()):
+        config_path = character_dir / "config.json"
+        if not config_path.exists():
+            continue
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Skip %s: failed to read config.json (%s)", character_dir, exc)
+            continue
+
+        name_en = str(data.get("name_en") or character_dir.name.replace("_", " ")).strip()
+        if (
+            target_set
+            and _normalize_name(name_en) not in target_set
+            and _normalize_name(character_dir.name) not in target_set
+        ):
+            continue
+
+        copied = package_character_images(name_en, character_dir, image_dirs, dry_run=dry_run)
+        if copied:
+            processed.append(character_dir.name)
+    return processed
 
 
 class CharacterBuilder:
@@ -497,11 +637,13 @@ class CharacterBuilder:
         self,
         prompt_dir: str = "result-prompts",
         voice_dir: str = "result-voices",
+        image_dir: str = "result-images",
         characters_dir: str = "characters",
         character_map_path: str = "umamusume_characters.json",
     ) -> None:
         self.prompt_dir = Path(prompt_dir)
         self.voice_dir = Path(voice_dir)
+        self.image_dir = Path(image_dir)
         self.characters_dir = Path(characters_dir)
         self.character_map_path = Path(character_map_path)
 
@@ -511,16 +653,31 @@ class CharacterBuilder:
         workers: int = 1,
         target_characters: Optional[Iterable[str]] = None,
         max_candidates: Optional[int] = None,
+        include_images: bool = False,
     ) -> List[str]:
         return build_characters(
             prompt_dir=self.prompt_dir,
             voice_dir=self.voice_dir,
+            image_dir=self.image_dir,
             output_dir=self.characters_dir,
             character_map_path=self.character_map_path,
             workers=workers,
             dry_run=dry_run,
             target_characters=target_characters,
             max_candidates=max_candidates,
+            include_images=include_images,
+        )
+
+    def package_images(
+        self,
+        dry_run: bool = False,
+        target_characters: Optional[Iterable[str]] = None,
+    ) -> List[str]:
+        return package_existing_character_images(
+            image_dir=self.image_dir,
+            output_dir=self.characters_dir,
+            dry_run=dry_run,
+            target_characters=target_characters,
         )
 
     async def build_character(
@@ -528,12 +685,14 @@ class CharacterBuilder:
         character_name: str,
         workers: int = 1,
         max_candidates: Optional[int] = None,
+        include_images: bool = False,
     ) -> CharacterConfig:
         self.build_all(
             dry_run=False,
             workers=workers,
             target_characters=[character_name],
             max_candidates=max_candidates,
+            include_images=include_images,
         )
         config_path = self.characters_dir / _slugify(character_name) / "config.json"
         if not config_path.exists():

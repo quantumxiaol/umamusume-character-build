@@ -1,6 +1,6 @@
 # umamusume-character-build
 
-用于把上游项目产出的 `prompt` 与 `voice` 数据，构建成 `umamusume-agent` 可直接消费的角色卡目录（`characters/<character_slug>/`）。
+用于把上游项目产出的 `prompt`、`voice` 与可选 `image` 数据，构建成 `umamusume-agent` 可直接消费的角色卡目录（`characters/<character_slug>/`）。
 
 ## 前置数据来源
 
@@ -13,6 +13,7 @@
 
 - `result-prompts/`：来自 `umamusume-agent-prompt` 的角色提示词结果（如 `Admire_Vega.md`）
 - `result-voices/`：来自 `umamusume-voice-data` 的角色语音结果（如 `Admire Vega/*.mp3 + *_jp.txt + *_zh.txt`）
+- `result-images/`：可选，角色图片结果（如 `Admire Vega/Jsf_103301.png + Zf_103301.png`）
 
 ## 输出目录
 
@@ -24,7 +25,9 @@ characters/<character_slug>/
 ├── prompt.md
 ├── reference.mp3
 ├── reference_jp.txt
-└── reference_zh.txt
+├── reference_zh.txt
+├── JSF_<character-name>.png
+└── ZF_<character-name>.png
 ```
 
 ## 安装依赖
@@ -47,6 +50,19 @@ uv run python main.py -c "Admire Vega" --workers 4
 uv run python main.py --workers 4
 ```
 
+构建时同时打包角色图片：
+
+```bash
+uv run python main.py -c "Admire Vega" --workers 4 --include-images
+```
+
+只给已构建角色补充图片：
+
+```bash
+uv run python main.py --images-only
+uv run python main.py --images-only -c "Admire Vega"
+```
+
 预览不落盘：
 
 ```bash
@@ -63,6 +79,8 @@ uv run python main.py -c "Admire Vega" --dry-run --workers 4 --verbose
 - 如果 `result-voices/` 中缺少该角色音频（或音频全不合格），也会继续构建，并在 `voice_config` 写入 `"no_voice": "true"`。
 - 角色名优先通过 `result-prompts/*.md` 与 `result-voices/<角色英文名>/` 自动匹配。
 - 若存在 `umamusume_characters.json`，会用于英文名到中文名映射；没有时会从 prompt 标题自动提取中文名。
+- 可通过 `--include-images` 打包 `result-images/<角色英文名>/` 下的 `Jsf_*` 与 `Zf_*` 图片到角色目录，文件名会重命名为 `JSF_<角色英文名连字符>.png` / `ZF_<角色英文名连字符>.png`（保留原始图片扩展名）。
+- 可通过 `--images-only` 给 `characters/` 中已构建的角色补充图片，不会重建 prompt 或重新筛选音频。
 
 ## Torch 阈值校准
 
