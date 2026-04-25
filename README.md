@@ -55,7 +55,7 @@ uv run python main.py -c "Admire Vega" --dry-run --workers 4 --verbose
 
 ## 说明
 
-- 音频筛选目标是给 Index TTS 做音色克隆的单条高质量参考音频。
+- 音频筛选目标是给 Index TTS / Qwen3-TTS 等做音色克隆的单条高质量参考音频，默认要求有效语音时长 5-25 秒，并过滤静音过多或中间空白过长的音频。
 - 可通过 `.env` 指定音频分析设备：`device=cpu` / `device=mps` / `device=cuda`（不可用时自动回退 CPU）。
 - 当 `device` 为 `mps/cuda` 时，音频分析会启用 Torch 路径，并使用校准后的 Torch 音高阈值。
 - 候选音频会先做全局质量分析，再按**每个角色**的候选分布自适应阈值（避免低沉声线被全局阈值误伤）。

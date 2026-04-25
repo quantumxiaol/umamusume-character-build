@@ -25,8 +25,9 @@ class TextFilterConfig:
 
 @dataclass(frozen=True)
 class AudioFilterConfig:
-    min_duration: float = 3.0
-    max_duration: float = 35.0
+    # Clone prompt audio should contain enough actual speech without becoming a long monologue.
+    min_duration: float = 5.0
+    max_duration: float = 25.0
     min_centroid: float = 1200.0
     min_f0_std: float = 20.0
     max_pitch_range: float = 340.0
@@ -602,9 +603,9 @@ def score_audio(
 
     if quality.effective_duration:
         score += quality.effective_duration
-        if 10.0 <= quality.effective_duration <= 15.0:
+        if 8.0 <= quality.effective_duration <= 15.0:
             score += 3.0
-        elif cfg.min_duration <= quality.effective_duration < 10.0:
+        elif 5.0 <= quality.effective_duration < 8.0:
             score += 2.0
         elif 15.0 < quality.effective_duration <= cfg.max_duration:
             score += 1.0
