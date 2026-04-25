@@ -57,7 +57,22 @@ uv run python main.py -c "Admire Vega" --dry-run --workers 4 --verbose
 
 - 音频筛选目标是给 Index TTS 做音色克隆的单条高质量参考音频。
 - 可通过 `.env` 指定音频分析设备：`device=cpu` / `device=mps` / `device=cuda`（不可用时自动回退 CPU）。
+- 当 `device` 为 `mps/cuda` 时，音频分析会启用 Torch 路径，并使用校准后的 Torch 音高阈值。
+- 候选音频会先做全局质量分析，再按**每个角色**的候选分布自适应阈值（避免低沉声线被全局阈值误伤）。
 - 构建以 `result-prompts/` 为主：只要 prompt 存在，就会构建角色目录。
 - 如果 `result-voices/` 中缺少该角色音频（或音频全不合格），也会继续构建，并在 `voice_config` 写入 `"no_voice": "true"`。
 - 角色名优先通过 `result-prompts/*.md` 与 `result-voices/<角色英文名>/` 自动匹配。
 - 若存在 `umamusume_characters.json`，会用于英文名到中文名映射；没有时会从 prompt 标题自动提取中文名。
+
+## Torch 阈值校准
+
+可用脚本重新校准 Torch 音高阈值（以 librosa 基线为教师，默认使用 `balanced` 目标）：
+
+```bash
+uv run python scripts/calibrate_torch_pitch.py --sample-size 300 --objective balanced
+```
+
+当前默认 Torch 阈值（`src/umamusume_character_build/quality_filter.py`，作为全局基线）：
+
+- `torch_min_f0_std = 54`
+- `torch_max_pitch_range = 308`

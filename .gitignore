@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .env
+.DS_Store
 
 characters/
 # Generate by umamusume-agent-prompt

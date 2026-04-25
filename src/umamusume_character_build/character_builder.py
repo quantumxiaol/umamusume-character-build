@@ -19,8 +19,10 @@ from .quality_filter import (
     AudioFilterConfig,
     AudioQuality,
     analyze_audio,
+    character_adaptive_audio_config,
     get_audio_analysis_device,
     is_valid_japanese_text,
+    quality_reason,
     score_audio,
 )
 
@@ -175,7 +177,8 @@ def _select_best_audio(
             elif issue_type == "zh":
                 logger.info('Flag "%s": zh text issue (%s)', display_path, reason)
             elif issue_type == "audio":
-                logger.info('Flag "%s": audio issue (%s)', display_path, reason)
+                # Audio issue is re-evaluated with per-character adaptive thresholds later.
+                continue
             else:
                 logger.info('Flag "%s": issue (%s)', display_path, reason)
 
@@ -205,12 +208,47 @@ def _select_best_audio(
         for args in candidate_args:
             _handle_result(_evaluate_candidate(*args))
 
-    def _score(selection: AudioSelection) -> float:
-        size_bonus = min(selection.size_bytes / 1_000_000.0, 5.0) * 0.1
-        return score_audio(selection.quality, config) + selection.text_score + size_bonus
-
     if not selections:
         return None
+
+    pitch_backend = "torch" if analysis_device != "cpu" else "librosa"
+    config = character_adaptive_audio_config(
+        [s.quality for s in selections],
+        config=config,
+        pitch_backend=pitch_backend,
+    )
+    min_f0_std = config.torch_min_f0_std if pitch_backend == "torch" else config.min_f0_std
+    max_pitch_range = config.torch_max_pitch_range if pitch_backend == "torch" else config.max_pitch_range
+    logger.info(
+        "Adaptive thresholds for %s (%s): min_centroid=%.1f min_f0_std=%.1f max_pitch_range=%.1f",
+        voice_dir.name,
+        pitch_backend,
+        config.min_centroid,
+        min_f0_std,
+        max_pitch_range,
+    )
+
+    adjusted: List[AudioSelection] = []
+    for selection in selections:
+        reason = quality_reason(selection.quality, config=config, pitch_backend=pitch_backend)
+        if reason:
+            logger.info('Flag "%s": audio issue (%s)', selection.audio_path, reason)
+        adjusted.append(
+            AudioSelection(
+                audio_path=selection.audio_path,
+                text_jp=selection.text_jp,
+                text_zh=selection.text_zh,
+                quality=selection.quality,
+                audio_issue=reason,
+                size_bytes=selection.size_bytes,
+                text_score=selection.text_score,
+            )
+        )
+    selections = adjusted
+
+    def _score(selection: AudioSelection) -> float:
+        size_bonus = min(selection.size_bytes / 1_000_000.0, 5.0) * 0.1
+        return score_audio(selection.quality, config, pitch_backend=pitch_backend) + selection.text_score + size_bonus
 
     valid_audio = [s for s in selections if s.audio_issue is None]
     pool = valid_audio if valid_audio else selections

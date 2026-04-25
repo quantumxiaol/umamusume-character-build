@@ -5,11 +5,12 @@ Quality filters for prompt text and voice samples.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,11 @@ class AudioFilterConfig:
     min_centroid: float = 1200.0
     min_f0_std: float = 20.0
     max_pitch_range: float = 340.0
+    # Calibrated thresholds for Torch pitch extraction (result-voices, 2026-03).
+    torch_min_f0_std: float = 54.0
+    torch_max_pitch_range: float = 308.0
+    torch_pitch_freq_low: float = 70.0
+    torch_pitch_freq_high: float = 400.0
     max_silence_ratio: float = 0.4
     max_silence_sec: float = 2.0
     top_db: float = 30.0
@@ -164,7 +170,19 @@ def is_valid_japanese_text(text: str, config: TextFilterConfig | None = None) ->
     return True, "ok"
 
 
-def _quality_reason(quality: AudioQuality, cfg: AudioFilterConfig) -> Optional[str]:
+def _pitch_thresholds(cfg: AudioFilterConfig, pitch_backend: str) -> Tuple[float, float]:
+    if pitch_backend == "torch":
+        return cfg.torch_min_f0_std, cfg.torch_max_pitch_range
+    return cfg.min_f0_std, cfg.max_pitch_range
+
+
+def _quality_reason(
+    quality: AudioQuality,
+    cfg: AudioFilterConfig,
+    pitch_backend: str = "librosa",
+) -> Optional[str]:
+    min_f0_std, max_pitch_range = _pitch_thresholds(cfg, pitch_backend)
+
     if quality.effective_duration is not None:
         if quality.effective_duration < cfg.min_duration or quality.effective_duration > cfg.max_duration:
             return "duration_out_of_range"
@@ -178,10 +196,10 @@ def _quality_reason(quality: AudioQuality, cfg: AudioFilterConfig) -> Optional[s
     if quality.spectral_centroid is not None and quality.spectral_centroid < cfg.min_centroid:
         return "too_muddy"
 
-    if quality.f0_std is not None and quality.f0_std < cfg.min_f0_std:
+    if quality.f0_std is not None and quality.f0_std < min_f0_std:
         return "monotone_or_humming"
 
-    if quality.pitch_range is not None and quality.pitch_range > cfg.max_pitch_range:
+    if quality.pitch_range is not None and quality.pitch_range > max_pitch_range:
         return "singing_pitch_range"
 
     return None
@@ -315,7 +333,7 @@ def _analyze_audio_cpu(
             max_silence_sec=quality.max_silence_sec,
             nasal_ratio=quality.nasal_ratio,
         )
-        return quality, _quality_reason(quality, cfg)
+        return quality, _quality_reason(quality, cfg, pitch_backend="librosa")
     except Exception:
         return _empty_quality(), "analysis_failed"
 
@@ -436,55 +454,46 @@ def _spectral_centroid_torch(samples, sample_rate: int) -> Optional[float]:
     return float(centroid.detach().cpu().item())
 
 
-def _pitch_stats_torch(samples, sample_rate: int) -> Tuple[Optional[float], Optional[float]]:
-    import torch
+def _pitch_stats_torch(
+    samples,
+    sample_rate: int,
+    cfg: AudioFilterConfig,
+) -> Tuple[Optional[float], Optional[float]]:
+    import torchaudio
 
     if samples.numel() == 0:
         return None, None
 
-    frame_length = max(512, int(sample_rate * 0.04))
-    hop_length = max(160, int(sample_rate * 0.01))
-    if samples.shape[0] < frame_length:
-        return None, None
+    wave = samples.unsqueeze(0)
+    try:
+        f0 = torchaudio.functional.detect_pitch_frequency(
+            wave,
+            sample_rate=sample_rate,
+            frame_time=0.01,
+            freq_low=cfg.torch_pitch_freq_low,
+            freq_high=cfg.torch_pitch_freq_high,
+        )
+    except Exception:
+        try:
+            # Some torchaudio kernels are CPU-only on specific backends.
+            f0 = torchaudio.functional.detect_pitch_frequency(
+                wave.to("cpu"),
+                sample_rate=sample_rate,
+                frame_time=0.01,
+                freq_low=cfg.torch_pitch_freq_low,
+                freq_high=cfg.torch_pitch_freq_high,
+            ).to(samples.device)
+        except Exception:
+            return None, None
 
-    frames = samples.unfold(0, frame_length, hop_length)
-    if frames.numel() == 0:
-        return None, None
-
-    window = torch.hann_window(frame_length, device=samples.device, dtype=samples.dtype)
-    frames = frames * window.unsqueeze(0)
-
-    fft_size = 1
-    while fft_size < frame_length * 2:
-        fft_size *= 2
-
-    spectrum = torch.fft.rfft(frames, n=fft_size, dim=1)
-    power = torch.abs(spectrum) ** 2
-    autocorr = torch.fft.irfft(power, n=fft_size, dim=1)[:, :frame_length]
-
-    min_lag = max(1, int(sample_rate / 2093.0))
-    max_lag = min(frame_length - 1, int(sample_rate / 65.4))
-    if max_lag <= min_lag:
-        return None, None
-
-    candidate = autocorr[:, min_lag : max_lag + 1]
-    peak_values, peak_indices = torch.max(candidate, dim=1)
-    base_energy = torch.clamp(autocorr[:, 0], min=1e-9)
-    confidence = peak_values / base_energy
-    valid_mask = confidence > 0.2
-    if int(valid_mask.sum().detach().cpu().item()) < 5:
-        return None, None
-
-    lags = (peak_indices + min_lag).to(dtype=torch.float32)
-    f0 = sample_rate / torch.clamp(lags, min=1.0)
-    valid = f0[valid_mask]
+    valid = f0[f0 > 0]
     if valid.numel() < 5:
         return None, None
 
-    p10 = torch.quantile(valid, 0.1)
-    p90 = torch.quantile(valid, 0.9)
+    p10 = valid.quantile(0.1)
+    p90 = valid.quantile(0.9)
     pitch_range = p90 - p10
-    pitch_std = torch.std(valid, unbiased=False)
+    pitch_std = valid.std(unbiased=False)
     return float(pitch_std.detach().cpu().item()), float(pitch_range.detach().cpu().item())
 
 
@@ -540,9 +549,12 @@ def _analyze_audio_accelerated(
         effective_duration = float(voiced_duration)
         trimmed_np, _ = librosa.effects.trim(samples_np, top_db=cfg.top_db)
 
-        # Keep textural/acoustic features identical to legacy CPU path for stable scoring.
+        # Keep timbral features on legacy CPU path for stable scoring.
         centroid = _spectral_centroid(trimmed_np, sample_rate)
-        pitch_std, pitch_range = _pitch_stats(trimmed_np, sample_rate)
+        pitch_std, pitch_range = _pitch_stats_torch(samples, sample_rate, cfg)
+        if pitch_std is None or pitch_range is None:
+            # Fallback to librosa pitch if torchaudio kernel is unavailable.
+            pitch_std, pitch_range = _pitch_stats(trimmed_np, sample_rate)
         nasal_ratio = _nasal_ratio(trimmed_np, sample_rate)
 
         quality = AudioQuality(
@@ -556,7 +568,7 @@ def _analyze_audio_accelerated(
             max_silence_sec=max_silence_sec,
             nasal_ratio=nasal_ratio,
         )
-        return quality, _quality_reason(quality, cfg)
+        return quality, _quality_reason(quality, cfg, pitch_backend="torch")
     except Exception as exc:
         logger.warning(
             'Accelerated audio analysis failed on "%s" with device=%s (%s), fallback to cpu',
@@ -578,8 +590,14 @@ def analyze_audio(
     return _analyze_audio_accelerated(audio_path, cfg, device)
 
 
-def score_audio(quality: AudioQuality, config: AudioFilterConfig | None = None) -> float:
+def score_audio(
+    quality: AudioQuality,
+    config: AudioFilterConfig | None = None,
+    pitch_backend: Optional[str] = None,
+) -> float:
     cfg = config or AudioFilterConfig()
+    backend = pitch_backend or ("torch" if get_audio_analysis_device() != "cpu" else "librosa")
+    min_f0_std, max_pitch_range = _pitch_thresholds(cfg, backend)
     score = 0.0
 
     if quality.effective_duration:
@@ -612,12 +630,85 @@ def score_audio(quality: AudioQuality, config: AudioFilterConfig | None = None) 
             score -= (quality.nasal_ratio - 1.6) * 8.0
 
     if quality.f0_std is not None:
-        if quality.f0_std < cfg.min_f0_std:
-            score -= (cfg.min_f0_std - quality.f0_std) / max(cfg.min_f0_std, 1.0) * 6.0
+        if quality.f0_std < min_f0_std:
+            score -= (min_f0_std - quality.f0_std) / max(min_f0_std, 1.0) * 6.0
         else:
             score += min(quality.f0_std / 50.0, 2.0)
 
-    if quality.pitch_range is not None and quality.pitch_range > cfg.max_pitch_range:
-        score -= (quality.pitch_range - cfg.max_pitch_range) / max(cfg.max_pitch_range, 1.0) * 5.0
+    if quality.pitch_range is not None and quality.pitch_range > max_pitch_range:
+        score -= (quality.pitch_range - max_pitch_range) / max(max_pitch_range, 1.0) * 5.0
 
     return score
+
+
+def quality_reason(
+    quality: AudioQuality,
+    config: AudioFilterConfig | None = None,
+    pitch_backend: Optional[str] = None,
+) -> Optional[str]:
+    cfg = config or AudioFilterConfig()
+    backend = pitch_backend or ("torch" if get_audio_analysis_device() != "cpu" else "librosa")
+    return _quality_reason(quality, cfg, pitch_backend=backend)
+
+
+def character_adaptive_audio_config(
+    qualities: Sequence[AudioQuality],
+    config: AudioFilterConfig | None = None,
+    pitch_backend: Optional[str] = None,
+) -> AudioFilterConfig:
+    """
+    Build per-character adaptive thresholds from candidate audio quality distribution.
+    This relaxes fixed global thresholds for naturally low/deep voices while keeping
+    silence/duration constraints unchanged.
+    """
+    import numpy as np
+
+    cfg = config or AudioFilterConfig()
+    backend = pitch_backend or ("torch" if get_audio_analysis_device() != "cpu" else "librosa")
+
+    def _clean(values):
+        out = []
+        for value in values:
+            if value is None:
+                continue
+            v = float(value)
+            if v <= 0.0 or not math.isfinite(v):
+                continue
+            out.append(v)
+        return out
+
+    centroids = _clean(q.spectral_centroid for q in qualities)
+    f0_stds = _clean(q.f0_std for q in qualities)
+    pitch_ranges = _clean(q.pitch_range for q in qualities)
+
+    min_centroid = cfg.min_centroid
+    if len(centroids) >= 6:
+        p30 = float(np.quantile(centroids, 0.30))
+        # Lower-bound to avoid admitting very muffled/noisy references.
+        min_centroid = max(700.0, min(cfg.min_centroid, p30 * 0.9))
+
+    min_f0_std, max_pitch_range = _pitch_thresholds(cfg, backend)
+    if len(f0_stds) >= 6:
+        p20 = float(np.quantile(f0_stds, 0.20))
+        floor = 28.0 if backend == "torch" else 12.0
+        min_f0_std = max(floor, min(min_f0_std, p20 * 0.8))
+
+    if len(pitch_ranges) >= 6:
+        p90 = float(np.quantile(pitch_ranges, 0.90))
+        cap = max_pitch_range * 1.8
+        max_pitch_range = min(cap, max(max_pitch_range, p90 * 1.15))
+
+    if backend == "torch":
+        return replace(
+            cfg,
+            min_centroid=min_centroid,
+            torch_min_f0_std=min_f0_std,
+            torch_max_pitch_range=max_pitch_range,
+        )
+
+    return replace(
+        cfg,
+        min_centroid=min_centroid,
+        min_f0_std=min_f0_std,
+        max_pitch_range=max_pitch_range,
+    )
