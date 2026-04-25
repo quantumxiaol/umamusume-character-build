@@ -85,6 +85,75 @@ def _find_text_files(audio_path: Path) -> Tuple[Optional[Path], Optional[Path]]:
 def _load_text(text_path: Path) -> str:
     return text_path.read_text(encoding="utf-8").strip()
 
+
+def _reference_text_style_score(text: str) -> float:
+    """
+    Prefer neutral spoken references over highly emotional, stuttered, or acted lines.
+    The text side is only a proxy, so this is a ranking penalty instead of a hard filter.
+    """
+    if not text:
+        return 0.0
+
+    score = 0.0
+    exclamations = text.count("！") + text.count("!")
+    questions = text.count("？") + text.count("?")
+    ellipses = text.count("…") + text.count("...")
+
+    score -= min(exclamations, 3) * 1.0
+    score -= min(questions, 2) * 0.35
+    score -= min(ellipses, 4) * 0.25
+
+    # Stuttered kana separated by punctuation, e.g. お、お姉さま / い、い、い.
+    stutter_matches = re.findall(r"([ぁ-んァ-ン])(?:[、,・]\1){1,}", text)
+    score -= min(len(stutter_matches), 4) * 2.5
+
+    emotional_patterns = [
+        r"うう",
+        r"うぅ",
+        r"ふえ",
+        r"うぇ",
+        r"はう",
+        r"はふ",
+        r"ふふ",
+        r"えへ",
+        r"はわ",
+        r"あう",
+        r"泣",
+        r"ドキドキ",
+        r"いたずら",
+        r"ハロウィン",
+        r"ヴァンパイア",
+        r"オバケ",
+        r"コウモリ",
+        r"衣装",
+        r"お菓子",
+        r"びゅーん",
+    ]
+    for pattern in emotional_patterns:
+        if re.search(pattern, text):
+            score -= 1.0
+
+    neutral_patterns = [
+        r"してたら",
+        r"届いた",
+        r"会った",
+        r"見つけた",
+        r"拾って",
+        r"準備",
+        r"読んで",
+        r"走って",
+        r"思った",
+    ]
+    for pattern in neutral_patterns:
+        if re.search(pattern, text):
+            score += 0.5
+
+    if exclamations == 0 and len(stutter_matches) == 0 and not re.search(r"うう|うぅ|ふえ|うぇ|はう|あう", text):
+        score += 1.0
+
+    return score
+
+
 def _evaluate_candidate(
     audio_path_str: str,
     text_jp_str: Optional[str],
@@ -117,6 +186,7 @@ def _evaluate_candidate(
             else:
                 text_score -= penalties.get(reason, 1.5)
                 issues.append(("jp", reason))
+            text_score += _reference_text_style_score(jp_text)
         else:
             text_score -= 0.5
             issues.append(("jp", "empty"))

@@ -26,7 +26,7 @@ class TextFilterConfig:
 @dataclass(frozen=True)
 class AudioFilterConfig:
     # Clone prompt audio should contain enough actual speech without becoming a long monologue.
-    min_duration: float = 5.0
+    min_duration: float = 4.5
     max_duration: float = 25.0
     min_centroid: float = 1200.0
     min_f0_std: float = 20.0
