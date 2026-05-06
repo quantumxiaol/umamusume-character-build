@@ -98,14 +98,25 @@ def _reference_text_style_score(text: str) -> float:
     exclamations = text.count("！") + text.count("!")
     questions = text.count("？") + text.count("?")
     ellipses = text.count("…") + text.count("...")
+    musical_marks = text.count("♪") + text.count("♡") + text.count("♥")
+    drawn_marks = text.count("～")
+    prolonged_marks = len(re.findall(r"[ぁ-んァ-ン][ー〜～]+", text))
+    small_vowel_drawls = len(re.findall(r"[ぁ-んァ-ン][ぁぃぅぇぉァィゥェォ]", text))
+    drawl_endings = len(re.findall(r"(?:よね|だね|かな|な|わ|ぞ|ね|よ)[ぇぁぃぅぉー〜～]", text))
 
-    score -= min(exclamations, 3) * 1.0
-    score -= min(questions, 2) * 0.35
+    score -= min(exclamations, 3) * 0.9
+    score -= min(questions, 2) * 0.45
     score -= min(ellipses, 4) * 0.25
+    score -= min(musical_marks, 2) * 2.0
+    score -= min(drawn_marks, 3) * 0.25
+    score -= min(prolonged_marks, 4) * 1.1
+    score -= min(small_vowel_drawls, 4) * 0.9
+    score -= min(drawl_endings, 3) * 1.0
+    score -= min(len(re.findall(r"[！？!?]{2,}", text)), 2) * 1.5
 
     # Stuttered kana separated by punctuation, e.g. お、お姉さま / い、い、い.
     stutter_matches = re.findall(r"([ぁ-んァ-ン])(?:[、,・]\1){1,}", text)
-    score -= min(len(stutter_matches), 4) * 2.5
+    score -= min(len(stutter_matches), 4) * 3.0
 
     emotional_patterns = [
         r"うう",
@@ -128,10 +139,29 @@ def _reference_text_style_score(text: str) -> float:
         r"衣装",
         r"お菓子",
         r"びゅーん",
+        r"あはは",
+        r"えへへ",
+        r"げげ",
+        r"くそ",
+        r"いやぁ",
+        r"ああ",
+        r"喜び",
+        r"嬉",
+        r"楽し",
+        r"最高",
+        r"眩し",
+        r"キラキラ",
+        r"はしゃ",
+        r"熱血",
+        r"緊張",
+        r"泣",
+        r"怒",
+        r"叫",
+        r"悲",
     ]
     for pattern in emotional_patterns:
         if re.search(pattern, text):
-            score -= 1.0
+            score -= 1.25
 
     neutral_patterns = [
         r"してたら",
@@ -143,15 +173,48 @@ def _reference_text_style_score(text: str) -> float:
         r"読んで",
         r"走って",
         r"思った",
+        r"判断",
+        r"確認",
+        r"継続",
+        r"案内",
     ]
     for pattern in neutral_patterns:
         if re.search(pattern, text):
             score += 0.5
 
-    if exclamations == 0 and len(stutter_matches) == 0 and not re.search(r"うう|うぅ|ふえ|うぇ|はう|あう", text):
-        score += 1.0
+    if (
+        exclamations == 0
+        and musical_marks == 0
+        and len(stutter_matches) == 0
+        and not re.search(r"うう|うぅ|ふえ|うぇ|はう|あう|あはは|えへへ", text)
+    ):
+        score += 1.5
 
     return score
+
+
+def _spoken_char_count(text: str) -> int:
+    return len(re.findall(r"[0-9A-Za-zぁ-んァ-ン一-龯々〆ヵヶ]", text))
+
+
+def _speech_rate_score(text: str, effective_duration: Optional[float]) -> float:
+    if not text or not effective_duration or effective_duration <= 0.0:
+        return 0.0
+
+    chars = _spoken_char_count(text)
+    if chars < 8:
+        return -0.5
+
+    chars_per_second = chars / effective_duration
+    if 3.8 <= chars_per_second <= 6.8:
+        return 0.8
+    if 3.0 <= chars_per_second < 3.8:
+        return 0.2
+    if 6.8 < chars_per_second <= 7.6:
+        return -0.4
+    if chars_per_second > 7.6:
+        return -1.2 - min((chars_per_second - 7.6) * 0.4, 2.0)
+    return -1.0
 
 
 def _evaluate_candidate(
@@ -162,6 +225,7 @@ def _evaluate_candidate(
     audio_path = Path(audio_path_str)
     issues: List[Tuple[str, str]] = []
     text_score = 0.0
+    jp_text = ""
 
     penalties = {
         "humming_or_singing": 6.0,
@@ -171,6 +235,7 @@ def _evaluate_candidate(
         "too_short": 2.0,
         "too_long": 2.0,
         "no_kanji": 2.0,
+        "acted_or_filler": 2.5,
     }
 
     if text_jp_str:
@@ -206,6 +271,7 @@ def _evaluate_candidate(
     quality, audio_reason = analyze_audio(audio_path_str)
     if audio_reason:
         issues.append(("audio", audio_reason))
+    text_score += _speech_rate_score(jp_text, quality.effective_duration)
 
     size_bytes = audio_path.stat().st_size
     return (audio_path_str, text_jp_str, text_zh_str, quality, size_bytes, text_score, audio_reason, issues)

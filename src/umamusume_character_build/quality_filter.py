@@ -26,8 +26,8 @@ class TextFilterConfig:
 @dataclass(frozen=True)
 class AudioFilterConfig:
     # Clone prompt audio should contain enough actual speech without becoming a long monologue.
-    min_duration: float = 4.5
-    max_duration: float = 25.0
+    min_duration: float = 6.0
+    max_duration: float = 30.0
     min_centroid: float = 1200.0
     min_f0_std: float = 20.0
     max_pitch_range: float = 340.0
@@ -36,9 +36,14 @@ class AudioFilterConfig:
     torch_max_pitch_range: float = 308.0
     torch_pitch_freq_low: float = 70.0
     torch_pitch_freq_high: float = 400.0
-    max_silence_ratio: float = 0.4
-    max_silence_sec: float = 2.0
+    max_silence_ratio: float = 0.32
+    max_silence_sec: float = 1.2
     top_db: float = 30.0
+    use_vad: bool = True
+    vad_threshold: float = 0.5
+    vad_min_speech_ms: int = 250
+    vad_min_silence_ms: int = 120
+    vad_speech_pad_ms: int = 30
 
 
 @dataclass(frozen=True)
@@ -160,6 +165,7 @@ def is_valid_japanese_text(text: str, config: TextFilterConfig | None = None) ->
         if re.search(pattern, cleaned):
             if "ふん" in pattern or "ララ" in pattern or "ルル" in pattern:
                 return False, "humming_or_singing"
+            return False, "acted_or_filler"
 
     if re.search(r"([ぁ-んァ-ン])\1{2,}", cleaned):
         return False, "repetitive_kana"
@@ -184,6 +190,10 @@ def _quality_reason(
 ) -> Optional[str]:
     min_f0_std, max_pitch_range = _pitch_thresholds(cfg, pitch_backend)
 
+    if quality.duration is not None:
+        if quality.duration < cfg.min_duration or quality.duration > cfg.max_duration:
+            return "duration_out_of_range"
+
     if quality.effective_duration is not None:
         if quality.effective_duration < cfg.min_duration or quality.effective_duration > cfg.max_duration:
             return "duration_out_of_range"
@@ -204,6 +214,63 @@ def _quality_reason(
         return "singing_pitch_range"
 
     return None
+
+
+@lru_cache(maxsize=1)
+def _silero_vad_model():
+    from silero_vad import load_silero_vad
+
+    return load_silero_vad()
+
+
+def _vad_silence_stats(samples, sample_rate: int, cfg: AudioFilterConfig) -> Optional[Tuple[float, float, float]]:
+    if not cfg.use_vad:
+        return None
+
+    try:
+        import librosa
+        import torch
+        from silero_vad import get_speech_timestamps
+
+        total_duration = float(samples.shape[0] / sample_rate) if sample_rate else 0.0
+        if total_duration <= 0.0:
+            return 0.0, 1.0, 0.0
+
+        target_rate = 16000
+        work = samples
+        if sample_rate != target_rate:
+            work = librosa.resample(work, orig_sr=sample_rate, target_sr=target_rate)
+
+        tensor = torch.as_tensor(work, dtype=torch.float32, device=torch.device("cpu"))
+        timestamps = get_speech_timestamps(
+            tensor,
+            _silero_vad_model(),
+            sampling_rate=target_rate,
+            threshold=cfg.vad_threshold,
+            min_speech_duration_ms=cfg.vad_min_speech_ms,
+            min_silence_duration_ms=cfg.vad_min_silence_ms,
+            speech_pad_ms=cfg.vad_speech_pad_ms,
+            return_seconds=True,
+        )
+        if not timestamps:
+            return 0.0, 1.0, total_duration
+
+        speech_duration = 0.0
+        max_gap = 0.0
+        previous_end = 0.0
+        for timestamp in timestamps:
+            start = max(0.0, min(float(timestamp["start"]), total_duration))
+            end = max(start, min(float(timestamp["end"]), total_duration))
+            max_gap = max(max_gap, start - previous_end)
+            speech_duration += end - start
+            previous_end = max(previous_end, end)
+        max_gap = max(max_gap, total_duration - previous_end)
+
+        silence_ratio = max(0.0, min(1.0, 1.0 - speech_duration / total_duration))
+        return float(speech_duration), float(silence_ratio), float(max_gap)
+    except Exception as exc:
+        logger.debug("Silero VAD analysis failed, fallback to amplitude split (%s)", exc)
+        return None
 
 
 def _silence_stats(samples, sample_rate: int, top_db: float) -> Tuple[float, float, float]:
@@ -307,7 +374,8 @@ def _analyze_audio_cpu(
             return _empty_quality(), "empty_audio"
 
         duration = float(samples.shape[0] / sample_rate)
-        voiced_duration, silence_ratio, max_silence_sec = _silence_stats(samples, sample_rate, cfg.top_db)
+        vad_stats = _vad_silence_stats(samples, sample_rate, cfg)
+        voiced_duration, silence_ratio, max_silence_sec = vad_stats or _silence_stats(samples, sample_rate, cfg.top_db)
         effective_duration = float(voiced_duration)
         trimmed, _ = librosa.effects.trim(samples, top_db=cfg.top_db)
 
@@ -546,7 +614,8 @@ def _analyze_audio_accelerated(
         samples = torch.as_tensor(samples_np, dtype=torch.float32, device=torch.device(device))
 
         duration = float(samples.shape[0] / sample_rate)
-        voiced_duration, silence_ratio, max_silence_sec = _silence_stats_torch(samples, sample_rate, cfg.top_db)
+        vad_stats = _vad_silence_stats(samples_np, sample_rate, cfg)
+        voiced_duration, silence_ratio, max_silence_sec = vad_stats or _silence_stats_torch(samples, sample_rate, cfg.top_db)
         effective_duration = float(voiced_duration)
         trimmed_np, _ = librosa.effects.trim(samples_np, top_db=cfg.top_db)
 
@@ -602,17 +671,23 @@ def score_audio(
     score = 0.0
 
     if quality.effective_duration:
-        score += quality.effective_duration
-        if 8.0 <= quality.effective_duration <= 15.0:
+        effective_duration = quality.effective_duration
+        score += max(0.0, 10.0 - abs(effective_duration - 10.0) * 0.7)
+        if 8.0 <= effective_duration <= 15.0:
             score += 3.0
-        elif 5.0 <= quality.effective_duration < 8.0:
+        elif cfg.min_duration <= effective_duration < 8.0:
             score += 2.0
-        elif 15.0 < quality.effective_duration <= cfg.max_duration:
+        elif 15.0 < effective_duration <= 22.0:
             score += 1.0
-        elif quality.effective_duration < cfg.min_duration:
-            score -= (cfg.min_duration - quality.effective_duration) * 2.0
-        elif quality.effective_duration > cfg.max_duration:
-            score -= (quality.effective_duration - cfg.max_duration) * 0.5
+        elif 22.0 < effective_duration <= cfg.max_duration:
+            score -= (effective_duration - 22.0) * 0.35
+        elif effective_duration < cfg.min_duration:
+            score -= (cfg.min_duration - effective_duration) * 2.0
+        elif effective_duration > cfg.max_duration:
+            score -= (effective_duration - cfg.max_duration) * 0.5
+
+    if quality.duration and quality.duration > 18.0:
+        score -= (quality.duration - 18.0) * 0.15
 
     if quality.spectral_centroid:
         score += min(quality.spectral_centroid / 1000.0, 3.0)
